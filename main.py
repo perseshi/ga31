@@ -4,7 +4,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 import traceback
 
-BASE_URL = os.getenv("PUBLIC_BASE_URL", os.getenv("RENDER_EXTERNAL_URL", "http://localhost:8000")).rstrip("/") + "/a2a/"
+BASE_URL = os.getenv("PUBLIC_BASE_URL", os.getenv("RENDER_EXTERNAL_URL", "http://localhost:8000")).rstrip("/") + "/"
 LLM_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 LLM_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 LLM_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
@@ -54,6 +54,7 @@ def save(task, principal):
 
 # ---------- public Agent Card ----------
 @app_Q2.get("/.well-known/agent-card.json")
+@app_Q2.get("/a2a/.well-known/agent-card.json", include_in_schema=False)
 def card():
     return reply({
         "name": "Invoice Action Agent",
@@ -243,7 +244,8 @@ def proposal(p, d, policy):
             "evidenceRefs": r, "rationale": rationale}
 
 # ---------- message:send ----------
-@app_Q2.post("/a2a/message:send")
+@app_Q2.post("/message:send")
+@app_Q2.post("/a2a/message:send", include_in_schema=False)
 async def message_send(req: Request):
     principal, bad = gate(req, post=True)
     if bad: return bad
@@ -313,7 +315,8 @@ def continuation(principal, msg, part, mid, h):
         return reply({"task": task})
 
 # ---------- reads, list, cancel (NO model calls) ----------
-@app_Q2.get("/a2a/tasks/{tid}")
+@app_Q2.get("/tasks/{tid}")
+@app_Q2.get("/a2a/tasks/{tid}", include_in_schema=False)
 def get_task(tid: str, req: Request):
     principal, bad = gate(req)
     if bad: return bad
@@ -322,7 +325,8 @@ def get_task(tid: str, req: Request):
 
 MAX_LIST_BYTES = 350_000
 
-@app_Q2.get("/a2a/tasks")
+@app_Q2.get("/tasks")
+@app_Q2.get("/a2a/tasks", include_in_schema=False)
 def list_tasks(req: Request):
     principal, bad = gate(req)
     if bad: return bad
@@ -340,7 +344,8 @@ def list_tasks(req: Request):
         size += n
     return reply({"tasks": tasks})
 
-@app_Q2.post("/a2a/tasks/{tid}:cancel")
+@app_Q2.post("/tasks/{tid}:cancel")
+@app_Q2.post("/a2a/tasks/{tid}:cancel", include_in_schema=False)
 def cancel(tid: str, req: Request):
     principal, bad = gate(req)
     if bad: return bad
