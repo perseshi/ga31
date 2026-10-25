@@ -69,170 +69,27 @@ def card():
                     "tags": ["invoice", "finance", "approval"]}],
     })
 
-# ---------- AI layer (separate from protocol code) ----------
-PROMPT = """You are an accounts-payable analyst. For EACH package choose exactly one action:
-settle_invoice, request_approval, hold_invoice, reject_duplicate, open_exception.
+# ---------- AI reasoning and semantic decision cache ----------
+from reasoning import Reasoner, CACHE_VERSION
 
-Decision rules, apply in this order:
-1. The SAME invoice (same vendor AND same invoice number) was already paid -> reject_duplicate.
-   A payment for a DIFFERENT invoice number is NOT a duplicate.
-2. Vendor, amount, PO or receipt records materially conflict -> open_exception.
-3. A named verification (bank details, tax ID, goods receipt, etc.) must finish before payment -> hold_invoice.
-4. Amount exceeds the autonomous approval limit that applies to this case -> request_approval.
-5. ONLY if none of the above apply -> settle_invoice.
+def decision_key(policy, package):
+    content = {k: v for k, v in package.items() if k != "packageId"}
+    return sha(CACHE_VERSION + canon({"model": LLM_MODEL, "policy": policy, "package": content}))
 
-How to read the documents:
-- Find the ONE paragraph that states the controlling facts of THIS case. Return its three bracketed references,
-  copied exactly, brackets included, all from that single paragraph.
-- Ignore the cover sheet, archive examples, training material and decoys.
-- Negated statements ("not a duplicate", "no hold required") mean that action does NOT apply.
-- When unsure between settle_invoice and anything else, do NOT choose settle_invoice.
+def decision_cache_get(policy, package):
+    with dblock:
+        row = db.execute("SELECT body FROM cache WHERE h=?", (decision_key(policy, package),)).fetchone()
+    return json.loads(row[0]) if row else None
 
-Also return vendorName, invoiceNumber, amountMinor (integer, smallest currency unit, e.g. 1234.50 -> 123450),
-currency, and "reason": one sentence on why the evidence supports the action.
-Reply ONLY JSON: {"decisions":[{"packageId":"","action":"","vendorName":"","invoiceNumber":"","amountMinor":0,
-"currency":"","evidenceRefs":["","",""],"reason":""}]}"""
+def decision_cache_put(policy, package, decision):
+    with dblock:
+        db.execute("INSERT OR REPLACE INTO cache VALUES(?,?)", (decision_key(policy, package), json.dumps(decision)))
+        db.commit()
 
-CHECKS = ["valid_and_reconciled", "within_authority", "no_pending_verification",
-          "not_already_paid", "no_conflicting_records"]
-
-VERIFY = """A colleague proposed settle_invoice for the invoice package below. Be a skeptical reviewer.
-Read the paragraph that states the controlling facts of THIS case (ignore cover sheets, archive examples,
-training decoys, and negated statements). Answer each check with true or false:
-- valid_and_reconciled: invoice, PO and receipt records agree
-- within_authority: amount is within the autonomous approval limit that applies
-- no_pending_verification: nothing must be verified before payment
-- not_already_paid: this exact invoice (same vendor AND invoice number) has not already been paid
-- no_conflicting_records: no material conflict between records
-Then give the correct action (settle_invoice, request_approval, hold_invoice, reject_duplicate or open_exception)
-and the three exact bracketed references from the single controlling paragraph.
-Reply ONLY JSON: {"checks":{"valid_and_reconciled":true,"within_authority":true,"no_pending_verification":true,
-"not_already_paid":true,"no_conflicting_records":true},"action":"","evidenceRefs":["","",""],"reason":""}"""
-
-def refs_ok(refs, pkg_text):
-    return (isinstance(refs, list) and len(refs) == 3 and len(set(refs)) == 3
-            and all(isinstance(r, str) and re.fullmatch(r"\[[^\[\]]+\]", r) and r in pkg_text for r in refs))
-
-def valid(d, pkg_text):
-    return (d.get("action") in ACTIONS and refs_ok(d.get("evidenceRefs"), pkg_text)
-            and isinstance(d.get("amountMinor"), int)
-            and isinstance(d.get("vendorName"), str) and d["vendorName"]
-            and isinstance(d.get("invoiceNumber"), str) and d["invoiceNumber"])
-
-def settle_confirmed(v, pkg_text):
-    """Python, not the AI, makes the final call: every safety check must be exactly True."""
-    c = v.get("checks") or {}
-    return (v.get("action") == "settle_invoice"
-            and all(c.get(k) is True for k in CHECKS)
-            and refs_ok(v.get("evidenceRefs"), pkg_text))
-
-async def verify_settle(policy, p, sem):
-    async with sem:
-        try:
-            return await call_llm(VERIFY, f"Policy revision: {policy}\nPackage:\n{canon(p)}", 15)
-        except Exception:
-            traceback.print_exc()
-            return None            # no answer means we will NOT settle
-
-def log_line(obj):
-    with open(os.path.join(DATA_DIR, "decisions.jsonl"), "a") as f:
-        f.write(canon(obj) + "\n")
-
-async def call_llm(system, user, timeout):
-    if not LLM_KEY:
-        raise RuntimeError("Set GEMINI_API_KEY in the server environment")
-    async with httpx.AsyncClient(timeout=timeout) as c:
-        r = await c.post(
-            LLM_URL.format(model=LLM_MODEL),
-            headers={"Content-Type": "application/json", "X-goog-api-key": LLM_KEY},
-            json={
-                "systemInstruction": {"parts": [{"text": system}]},
-                "contents": [{
-                    "role": "user", 
-                    "parts": [{"text": user}]
-                }],
-                "generationConfig": {
-                    "temperature": 0, 
-                    "responseMimeType": "application/json"
-                }
-            })
-    r.raise_for_status()
-    text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)
-    s, e = text.find("{"), text.rfind("}")
-    return json.loads(text[s:e + 1])
-
-async def ask_llm(policy, pkgs):
-    res = await call_llm(PROMPT, f"Policy revision: {policy}\nPackages:\n{canon(pkgs)}", 25)
-    return res["decisions"]
-
-async def ask_llm_safe(policy, pkgs):
-    try:
-        return [d for d in await ask_llm(policy, pkgs) if isinstance(d, dict)]
-    except Exception:
-        traceback.print_exc()
-        return []
-
-CACHE_VERSION = "v3"     # bump this number every time you change a prompt or rule
-
-def pkg_key(p):
-    body = {k: v for k, v in p.items() if k != "packageId"}
-    return sha(CACHE_VERSION + canon(body))
+reasoner = Reasoner(LLM_KEY, LLM_MODEL, decision_cache_get, decision_cache_put)
 
 async def decide(policy, packages):
-    out, todo, fresh = {}, [], {}
-    for p in packages:
-        r = db.execute("SELECT body FROM cache WHERE h=?", (pkg_key(p),)).fetchone()
-        if r: out[p["packageId"]] = json.loads(r[0])
-        else: todo.append(p)
-    pending = list(todo)
-
-    # first pass (one retry for anything invalid)
-    for attempt in range(2):
-        if not todo: break
-        got = {d.get("packageId"): d for d in await ask_llm_safe(policy, todo)}
-        still = []
-        for p in todo:
-            d = got.get(p["packageId"])
-            if d and valid(d, canon(p)): fresh[p["packageId"]] = d
-            else: still.append(p)
-        todo = still
-
-    # second pass: verify every settle_invoice
-    by_id = {p["packageId"]: p for p in pending}
-    settles = [by_id[i] for i, d in fresh.items() if d["action"] == "settle_invoice"]
-    sem = asyncio.Semaphore(4)
-    verdicts = await asyncio.gather(*[verify_settle(policy, p, sem) for p in settles])
-    verdict_of = {p["packageId"]: v for p, v in zip(settles, verdicts)}
-
-    for p in pending:
-        pid, text = p["packageId"], canon(p)
-        d = fresh.get(pid)
-        cacheable = True
-        if d is None:                                   # AI failed twice
-            d = {"action": "open_exception", "vendorName": "unknown", "invoiceNumber": "unknown",
-                 "amountMinor": 0, "currency": "INR", "evidenceRefs": ["", "", ""], "reason": ""}
-            cacheable = False
-        elif d["action"] == "settle_invoice":
-            v = verdict_of.get(pid)
-            if v is None:                               # verifier failed -> never settle
-                d = {**d, "action": "open_exception"}
-                cacheable = False
-            elif settle_confirmed(v, text):
-                d = {**d, "reason": v.get("reason") or d.get("reason", "")}   # confirmed
-            elif v.get("action") in ACTIONS - {"settle_invoice"} and refs_ok(v.get("evidenceRefs"), text):
-                d = {**d, "action": v["action"], "evidenceRefs": v["evidenceRefs"], "reason": v.get("reason", "")}
-            else:                                       # disagreement we can't resolve
-                d = {**d, "action": "open_exception"}
-        out[pid] = d
-        log_line({"packageId": pid, "first": (fresh.get(pid) or {}).get("action"),
-                  "final": d["action"], "refs": d["evidenceRefs"], "verdict": verdict_of.get(pid)})
-        if d["action"] == "settle_invoice":             # keep the text of every settle so you can read it
-            log_line({"SETTLED_PACKAGE": pid, "text": text})
-        if cacheable:
-            db.execute("INSERT OR REPLACE INTO cache VALUES(?,?)", (pkg_key(p), json.dumps(d)))
-    db.commit()
-    return out
+    return await reasoner.decide(policy, packages)
 
 def proposal(p, d, policy):
     a, r = d["action"], d["evidenceRefs"]
@@ -361,3 +218,4 @@ def cancel(tid: str, req: Request):
 @app_Q2.get("/healthz")
 def healthz():
     return {"status": "ok", "geminiConfigured": bool(LLM_KEY)}
+
